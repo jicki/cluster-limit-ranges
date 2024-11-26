@@ -5,7 +5,7 @@ metadata:
 spec:
   containers:
     - name: write-container
-      image: reg.deeproute.ai/deeproute-public/busybox:1.31.0
+      image: busybox:1.31.0
       command:
         - sh
         - -c
