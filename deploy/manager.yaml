@@ -16,7 +16,7 @@ spec:
       serviceAccountName: limitrange-controller
       containers:
         - name: cluster-limit-controller
-          image: <your-operator-image>
+          image: jicki/cluster-limit-controller:1.9
           command:
             - ./app/cluster-limit-controller
           imagePullPolicy: IfNotPresent
