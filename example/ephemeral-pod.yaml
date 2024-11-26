@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ephemeral-storage-overwrite
+spec:
+  containers:
+    - name: write-container
+      image: reg.deeproute.ai/deeproute-public/busybox:1.31.0
+      command:
+        - sh
+        - -c
+        - |
+          dd if=/dev/urandom of=/test-ephemeral/largefile bs=10M count=150 && echo "Write succeeded"
+      volumeMounts:
+        - mountPath: /test-ephemeral
+          name: ephemeral-volume
+  volumes:
+    - name: ephemeral-volume
+      emptyDir: {}

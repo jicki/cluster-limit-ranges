@@ -1,0 +1,97 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterlimits.jicki.cn  # 必须是 spec.names.plural + "." + spec.group 的形式
+spec:
+  group: jicki.cn
+  names:
+    kind: ClusterLimit
+    listKind: ClusterLimitList
+    plural: clusterlimits
+    singular: clusterlimit
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                limits:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                        description: "The type of the resource being limited, e.g., 'Container', 'Pod', 'PersistentVolumeClaim'."
+                        enum:
+                          - Container
+                          - Pod
+                          - PersistentVolumeClaim
+                      default:
+                        type: object
+                        properties:
+                          cpu:
+                            type: string
+                          memory:
+                            type: string
+                          ephemeral-storage:
+                            type: string
+                          storage:
+                            type: string
+                      defaultRequest:
+                        type: object
+                        properties:
+                          cpu:
+                            type: string
+                          memory:
+                            type: string
+                          ephemeral-storage:
+                            type: string
+                          storage:
+                            type: string
+                      max:
+                        type: object
+                        properties:
+                          cpu:
+                            type: string
+                          memory:
+                            type: string
+                          ephemeral-storage:
+                            type: string
+                          storage:
+                            type: string
+                      min:
+                        type: object
+                        properties:
+                          cpu:
+                            type: string
+                          memory:
+                            type: string
+                          ephemeral-storage:
+                            type: string
+                          storage:
+                            type: string
+                includeNamespaces:
+                  type: array
+                  items:
+                    type: string
+                  description: "List of namespaces to include in applying the ClusterLimit."
+                excludeNamespaces:
+                  type: array
+                  items:
+                    type: string
+                  description: "List of namespaces to exclude from the ClusterLimit."
+            status:
+              type: object
+              properties:
+                appliedNamespaces:
+                  type: array
+                  items:
+                    type: string
+                  description: "List of namespaces where the ClusterLimit has been applied."

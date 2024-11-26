@@ -1,0 +1,32 @@
+apiVersion: k8scloud.com/v1
+kind: ClusterLimit
+metadata:
+  name: global-limits
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+        ephemeral-storage: "1Gi"
+      defaultRequest:
+        cpu: "200m"
+        memory: "256Mi"
+        ephemeral-storage: "512Mi"
+      max:
+        cpu: "1"
+        memory: "1Gi"
+        ephemeral-storage: "2Gi"
+      min:
+        cpu: "100m"
+        memory: "128Mi"
+        ephemeral-storage: "256Mi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "10Gi"
+      min:
+        storage: "1Gi"
+  includeNamespaces:
+    - default
+  excludeNamespaces:
+    - kube-system
