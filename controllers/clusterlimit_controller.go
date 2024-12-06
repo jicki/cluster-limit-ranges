@@ -2,17 +2,29 @@ package controllers
 
 import (
 	"context"
-	"fmt"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sync"
+
 	v1core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	k8scloudv1 "github.com/jicki/cluster-limit-ranges/api/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"time"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
+const (
+	DefaultClusterLimitName = "global-limits"
+	DefaultLimitRangeName   = "default-limitrange"
+	ManagedLabelKey         = "clusterlimit"
+	ManagedLabelValue       = "managed"
 )
 
 type ClusterLimitReconciler struct {
@@ -22,48 +34,44 @@ type ClusterLimitReconciler struct {
 
 // Reconcile 核心逻辑
 func (r *ClusterLimitReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx).WithValues("ClusterLimit", req.NamespacedName)
 
 	var clusterLimit k8scloudv1.ClusterLimit
 	if err := r.Get(ctx, req.NamespacedName, &clusterLimit); err != nil {
 		if errors.IsNotFound(err) {
-			// ClusterLimit 资源不存在，进行相关的清理操作
+			// 如果是资源被删除，则执行清理逻辑
 			logger.Info("ClusterLimit resource not found, cleaning up related LimitRanges")
 			return r.cleanupLimitRanges(ctx)
 		}
-		// 其他错误，返回错误信息
-		logger.Error(err, "unable to fetch ClusterLimit")
+		logger.Error(err, "Unable to fetch ClusterLimit")
 		return ctrl.Result{}, err
 	}
 
-	// 如果 ClusterLimit 在删除中，删除相关 LimitRange
+	// 如果资源在删除过程中
 	if !clusterLimit.DeletionTimestamp.IsZero() {
 		logger.Info("ClusterLimit is being deleted, cleaning up related LimitRanges")
 		return r.cleanupLimitRanges(ctx)
 	}
 
-	// 定时扫描所有命名空间，处理未添加的 LimitRange
+	// 扫描并应用 LimitRange
 	r.scanAndApplyLimitRanges(ctx, &clusterLimit)
-
-	// 每30分钟扫描一次
-	return ctrl.Result{RequeueAfter: 30 * time.Minute}, nil
+	logger.Info("Reconciling ClusterLimit completed")
+	return ctrl.Result{}, nil
 }
 
 // scanAndApplyLimitRanges 扫描所有命名空间，应用 LimitRange
 func (r *ClusterLimitReconciler) scanAndApplyLimitRanges(ctx context.Context, clusterLimit *k8scloudv1.ClusterLimit) {
 	logger := log.FromContext(ctx)
 
-	// 获取所有命名空间
 	var namespaces v1core.NamespaceList
 	if err := r.List(ctx, &namespaces); err != nil {
-		logger.Error(err, "unable to list namespaces")
+		logger.Error(err, "Unable to list namespaces")
 		return
 	}
 
+	var wg sync.WaitGroup
 	for _, ns := range namespaces.Items {
 		namespace := ns.Name
-
-		// 处理 includeNamespaces 和 excludeNamespaces
 		if len(clusterLimit.Spec.IncludeNamespaces) > 0 && !contains(clusterLimit.Spec.IncludeNamespaces, namespace) {
 			continue
 		}
@@ -71,33 +79,69 @@ func (r *ClusterLimitReconciler) scanAndApplyLimitRanges(ctx context.Context, cl
 			continue
 		}
 
-		// 检查是否已经存在 LimitRange
-		var existingLimitRange v1core.LimitRange
-		err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "cluster-limit"}, &existingLimitRange)
-		if errors.IsNotFound(err) {
-			// 如果不存在，则创建新的 LimitRange
-			logger.Info("Creating LimitRange for new namespace", "namespace", namespace)
-			err = r.applyLimitRange(ctx, namespace, clusterLimit.Spec.Limits)
-			if err != nil {
-				logger.Error(err, "failed to create LimitRange", "namespace", namespace)
+		wg.Add(1)
+		go func(namespace string) {
+			defer wg.Done()
+			if err := r.handleNamespaceEvent(ctx, namespace); err != nil {
+				logger.Error(err, "Error processing namespace", "namespace", namespace)
 			}
-		} else if err != nil {
-			// 获取 LimitRange 时出现错误
-			logger.Error(err, "failed to get existing LimitRange", "namespace", namespace)
-		}
+		}(namespace)
 	}
+	wg.Wait()
 }
 
-// applyLimitRange 应用 LimitRange 到指定命名空间
-func (r *ClusterLimitReconciler) applyLimitRange(ctx context.Context, namespace string, limits []k8scloudv1.LimitItem) error {
-	logger := log.FromContext(ctx)
+// handleNamespaceEvent 处理命名空间事件
+func (r *ClusterLimitReconciler) handleNamespaceEvent(ctx context.Context, namespace string) error {
+	logger := log.FromContext(ctx).WithValues("Namespace", namespace)
+
+	// 检查命名空间是否已经存在任意 LimitRange
+	var limitRanges v1core.LimitRangeList
+	if err := r.List(ctx, &limitRanges, client.InNamespace(namespace)); err != nil {
+		logger.Error(err, "Unable to list LimitRanges in namespace", "namespace", namespace)
+		return err
+	}
+	if len(limitRanges.Items) > 0 {
+		logger.Info("Namespace already has LimitRange(s), skipping creation", "namespace", namespace)
+		return nil
+	}
+
+	// 获取所有 ClusterLimit
+	var clusterLimits k8scloudv1.ClusterLimitList
+	if err := r.List(ctx, &clusterLimits); err != nil {
+		logger.Error(err, "Unable to list ClusterLimits")
+		return err
+	}
+
+	for _, clusterLimit := range clusterLimits.Items {
+		if len(clusterLimit.Spec.IncludeNamespaces) > 0 && !contains(clusterLimit.Spec.IncludeNamespaces, namespace) {
+			continue
+		}
+		if contains(clusterLimit.Spec.ExcludeNamespaces, namespace) {
+			continue
+		}
+
+		logger.Info("Creating LimitRange for namespace", "namespace", namespace)
+		return r.createLimitRange(ctx, namespace, clusterLimit.Spec.Limits)
+	}
+
+	return nil
+}
+
+// createLimitRange 创建新的 LimitRange
+func (r *ClusterLimitReconciler) createLimitRange(ctx context.Context, namespace string, limits []k8scloudv1.LimitItem) error {
+	logger := log.FromContext(ctx).WithValues("Namespace", namespace)
 
 	limitRange := &v1core.LimitRange{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "cluster-limit",
+			Name:      DefaultLimitRangeName,
 			Namespace: namespace,
+			Labels: map[string]string{
+				ManagedLabelKey: ManagedLabelValue,
+			},
 		},
-		Spec: v1core.LimitRangeSpec{},
+		Spec: v1core.LimitRangeSpec{
+			// 填充默认配置
+		},
 	}
 
 	for _, limit := range limits {
@@ -111,48 +155,33 @@ func (r *ClusterLimitReconciler) applyLimitRange(ctx context.Context, namespace 
 		limitRange.Spec.Limits = append(limitRange.Spec.Limits, item)
 	}
 
-	// 创建或更新 LimitRange
 	err := r.Client.Create(ctx, limitRange)
-	if err != nil {
-		if errors.IsAlreadyExists(err) {
-			logger.Info("LimitRange already exists, updating it", "namespace", namespace)
-			return r.Client.Update(ctx, limitRange)
-		}
-		logger.Error(err, "failed to create LimitRange", "namespace", namespace)
+	if err != nil && !errors.IsAlreadyExists(err) {
+		logger.Error(err, "Failed to create LimitRange", "namespace", namespace)
 		return err
 	}
+
 	logger.Info("Successfully created LimitRange", "namespace", namespace)
 	return nil
 }
 
 // cleanupLimitRanges 清理由 ClusterLimit 创建的所有 LimitRange
 func (r *ClusterLimitReconciler) cleanupLimitRanges(ctx context.Context) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
 	var limitRanges v1core.LimitRangeList
-	if err := r.List(ctx, &limitRanges); err != nil {
+	if err := r.List(ctx, &limitRanges, client.MatchingLabels{ManagedLabelKey: ManagedLabelValue}); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	for _, lr := range limitRanges.Items {
-		// 检查是否是由该 ClusterLimit 创建的 LimitRange
-		if lr.Name == "cluster-limit" {
-			if err := r.Delete(ctx, &lr); err != nil {
-				return ctrl.Result{}, err
-			}
-			fmt.Printf("Deleted LimitRange %s in namespace %s\n", lr.Name, lr.Namespace)
+		if err := r.Delete(ctx, &lr); err != nil {
+			logger.Error(err, "Failed to delete LimitRange", "namespace", lr.Namespace)
+		} else {
+			logger.Info("Deleted LimitRange", "namespace", lr.Namespace)
 		}
 	}
-
 	return ctrl.Result{}, nil
-}
-
-// contains 判断字符串是否在数组中
-func contains(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
 }
 
 // toResourceList 将 map[string]string 转换为 v1core.ResourceList
@@ -164,9 +193,40 @@ func toResourceList(input map[string]string) v1core.ResourceList {
 	return result
 }
 
+func contains(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
+}
+
+// mapNamespaceToClusterLimit 实现 MapFunc
+func mapNamespaceToClusterLimit(ctx context.Context, obj client.Object) []reconcile.Request {
+	if _, ok := obj.(*v1core.Namespace); !ok {
+		return nil
+	}
+	return []reconcile.Request{
+		{NamespacedName: client.ObjectKey{Name: DefaultClusterLimitName}},
+	}
+}
+
 // SetupWithManager 注册控制器
 func (r *ClusterLimitReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&k8scloudv1.ClusterLimit{}).
+		Owns(&v1core.LimitRange{}).
+		Watches(
+			&v1core.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return mapNamespaceToClusterLimit(ctx, obj)
+			}),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					return true
+				},
+			}),
+		).
 		Complete(r)
 }
